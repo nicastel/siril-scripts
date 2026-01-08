@@ -3,7 +3,7 @@
 SPDX-License-Identifier: GPL-3.0-or-later
 
 Smart Telescope Preprocessing script
-Version: 2.0.1
+Version: 2.0.3
 =====================================
 
 The author of this script is Nazmus Nasir (Naztronomy) and can be reached at:
@@ -25,7 +25,34 @@ The following subdirectories are optional:
 """
 CHANGELOG:
 
+2.0.3 - Support for new Unistellar/Evscope telescopes (nicastel)
+      - Compression during processing (enabled by default and controlled by a flag)
+      - Forcing stacking to use -32b to fix Dwarf3's "milky" stacked image
+      - Better error handling with clean_ups
+      - Force local photometry catalog for SPCC
+      - Better gaia status layout in GUI
+      - Updated and more Tooltips
+      - Output stacking details
+      - Fixed max frames bug for linux and mac
+      - Updated tolerance for BGE 
+      - Add Dwarf Mini Support
+2.0.2 - Small Bug fixes
+      - Reenable feathering
+      - Fixed pixel fraction decimal precision
+      - Added 'DWARF 3' to auto find telescope from FITS header
+      - Disallow SPCC for Celestron Origin
+      - Bypasss seqplatesolve false error for now
+      - Issue #56 - don't crash if there are no lights
 2.0.1 - Allowing all os to batch
+      - Batch min size set to 50. Batch Max Size set based on OS: Windows 2000, Linux/Mac 25000
+      - Optional Black Frames Check
+      - Automatic Telescope Detection from FITS Header when available
+      - Removed feathering. Automatic feathering of panels still work.
+      - Fallback to regular registration if plate solving fails (which should accommodate any telescope now) and will not mosaic
+      - Added additional filters: background and star count
+      - Filters used only if checkbox is checked without default fallback
+      - Removed rbswapped file for Siril 1.4 RC1
+      - Full Celestron Origin Support - latest version of Celestron firmware only
 2.0.0 - Major version update:
       - Refactored code to use Qt6 instead of Tkinter for the GUI
       - Exposed extra filter options
@@ -48,6 +75,7 @@ import os
 import sys
 import math
 import shutil
+import time
 import sirilpy as s
 from datetime import datetime
 import json
@@ -77,28 +105,37 @@ from sirilpy import LogColor, NoImageError
 from astropy.io import fits
 import numpy as np
 
+
 # from tkinter import filedialog
 
 APP_NAME = "Naztronomy - Smart Telescope Preprocessing"
-VERSION = "2.0.1"
-BUILD = "20251010"
+VERSION = "2.0.3"
+BUILD = "20260102"
 AUTHOR = "Nazmus Nasir"
 WEBSITE = "Naztronomy.com"
 YOUTUBE = "YouTube.com/Naztronomy"
 TELESCOPES = [
     "ZWO Seestar S30",
     "ZWO Seestar S50",
+    "Dwarf Mini",
     "Dwarf 3",
     "Dwarf 2",
     "Celestron Origin",
+    "Unistellar eVscope 1 / eQuinox 1",
+    "Unistellar eVscope 2 / eQuinox 2",
+    "Unistellar Odyssey / Odyssey Pro",
 ]
 
 FILTER_OPTIONS_MAP = {
     "ZWO Seestar S30": ["No Filter (Broadband)", "LP (Narrowband)"],
     "ZWO Seestar S50": ["No Filter (Broadband)", "LP (Narrowband)"],
+    "Dwarf Mini": ["Astro filter (UV/IR)", "Dual-Band"],
     "Dwarf 3": ["Astro filter (UV/IR)", "Dual-Band"],
     "Dwarf 2": ["Astro filter (UV/IR)"],
     "Celestron Origin": ["No Filter (Broadband)"],
+    "Unistellar eVscope 1 / eQuinox 1": ["No Filter (Broadband)"],
+    "Unistellar eVscope 2 / eQuinox 2": ["No Filter (Broadband)"],
+    "Unistellar Odyssey / Odyssey Pro": ["No Filter (Broadband)"],
 }
 
 FILTER_COMMANDS_MAP = {
@@ -109,6 +146,18 @@ FILTER_COMMANDS_MAP = {
     "ZWO Seestar S50": {
         "No Filter (Broadband)": ["-oscfilter=UV/IR Block"],
         "LP (Narrowband)": ["-oscfilter=ZWO Seestar LP"],
+    },
+    "Dwarf Mini": {
+        "Astro filter (UV/IR)": ["-oscfilter=UV/IR Block"],
+        "Dual-Band": [
+            "-narrowband",
+            "-rwl=656.28",
+            "-rbw=18",
+            "-gwl=500.70",
+            "-gbw=30",
+            "-bwl=500.70",
+            "-bbw=30",
+        ],
     },
     "Dwarf 3": {
         "Astro filter (UV/IR)": ["-oscfilter=UV/IR Block"],
@@ -134,6 +183,10 @@ UI_DEFAULTS = {
     "drizzle_amount": 1.0,
     "pixel_fraction": 1.0,
     "max_files_per_batch": 2000,
+    "win_max_files_per_batch": 2000,
+    "mac_max_files_per_batch": 25000,
+    "linux_max_files_per_batch": 25000,
+    "enable_compression": True,
 }
 
 
@@ -151,6 +204,17 @@ class PreprocessingInterface(QMainWindow):
         self.drizzle_factor = 0
         self.filters_status = False
         self.initialization_successful = False
+
+        # Detect OS and set appropriate max files per batch
+        self.max_files_per_batch = 2000  # default
+        if sys.platform.startswith("win"):
+            self.max_files_per_batch = UI_DEFAULTS["win_max_files_per_batch"]
+        elif sys.platform.startswith("linux"):
+            self.max_files_per_batch = UI_DEFAULTS["linux_max_files_per_batch"]
+        elif sys.platform.startswith("darwin"):
+            self.max_files_per_batch = UI_DEFAULTS["mac_max_files_per_batch"]
+        else:
+            self.max_files_per_batch = UI_DEFAULTS["max_files_per_batch"]
 
         self.spcc_section = None
         self.spcc_checkbox = None
@@ -172,27 +236,42 @@ class PreprocessingInterface(QMainWindow):
             return
         try:
             self.siril.cmd("requires", "1.3.6")
-            self.siril.cmd("setcompress", "1 -type=rice 16")
+            if UI_DEFAULTS["enable_compression"]:
+                self.siril.cmd("setcompress", "1 -type=rice 16")
         except s.CommandError:
             self.close_dialog()
             return
 
         self.fits_extension = self.siril.get_siril_config("core", "extension")
 
-        self.gaia_catalogue_available = False
+        self.astrometry_gaia_available = False
         try:
-            catalog_status = self.siril.get_siril_config("core", "catalogue_gaia_astro")
+            self.astrometry_gaia_status = self.siril.get_siril_config("core", "catalogue_gaia_astro")
             if (
-                catalog_status
-                and catalog_status != "(not set)"
-                and os.path.isfile(catalog_status)
+                self.astrometry_gaia_status
+                and self.astrometry_gaia_status != "(not set)"
+                and os.path.isfile(self.astrometry_gaia_status)
             ):
-                self.gaia_catalogue_available = True
-
+                self.astrometry_gaia_available = True
         except s.CommandError:
             pass
+            
+        self.photometry_gaia_available = False
+        try:
+            self.photometry_gaia_status = self.siril.get_siril_config("core", "catalogue_gaia_photo")
+            if (
+                self.photometry_gaia_status
+                and self.photometry_gaia_status != "(not set)"
+                and os.path.isdir(self.photometry_gaia_status)
+            ):
+                self.photometry_gaia_available = True
+        except s.CommandError:
+            pass
+
         self.current_working_directory = self.siril.get_siril_wd()
         self.cwd_label_text = ""
+
+        self.initial_message()
 
         changed_cwd = False  # a way not to run the prompting loop
         initial_cwd = os.path.join(self.current_working_directory, "lights")
@@ -209,7 +288,7 @@ class PreprocessingInterface(QMainWindow):
         elif os.path.basename(self.current_working_directory.lower()) == "lights":
             msg = "You're currently in the 'lights' directory, do you want to select the parent directory?"
             answer = QMessageBox.question(self, "Already in Lights Dir", msg)
-            if answer == QMessageBox.Yes:
+            if answer == QMessageBox.StandardButton.Yes:
                 self.siril.cmd("cd", "../")
                 os.chdir(os.path.dirname(self.current_working_directory))
                 self.current_working_directory = os.path.dirname(
@@ -291,41 +370,151 @@ class PreprocessingInterface(QMainWindow):
                     )
                     continue
         self.create_widgets()
+        # Initialize fits_files_count before creating widgets
+        self.fits_files_count = 0
         self.set_telescope_from_fits()
 
         # self.setup_shortcuts()
         self.initialization_successful = True
 
+    def initial_message(self):
+        msg = f"""Welcome to {APP_NAME} v{VERSION}!
+        Please watch latest demos on https://youtube.com/Naztronomy which can answer most questions.
+        Here are some Frequently Asked Questions:
+        Q: Can it handle telescopes not listed in the dropdown?
+        A: Yes, but it will not mosaic them. It will do regular star registration. 
+        Q: How do I get support?
+        A: Join the Naztronomy Discord server for support and discussion. Please have your logs handy.
+        Q: Where can I find the logs?
+        A: You can export logs by clicking the download button on the lower right hand side of the console.\n
+        """
+        self.siril.log(msg, LogColor.BLUE)
+
     def set_telescope_from_fits(self):
         """Reads the first FITS file in lights directory and sets telescope based on TELESCOP header."""
         # Mapping from FITS header values to UI telescope names
         telescope_map = {
-            'Seestar S30': 'ZWO Seestar S30',
-            'Seestar S50': 'ZWO Seestar S50',
-            'DWARFII': 'Dwarf 2',
-            'DWARFIII': 'Dwarf 3',
-            'Origin': 'Celestron Origin'
+            "Seestar S30": "ZWO Seestar S30",
+            "Seestar S50": "ZWO Seestar S50",
+            "S50": "ZWO Seestar S50",
+            "DWARF mini": "Dwarf Mini",
+            "DWARFIII": "Dwarf 3",
+            "DWARF 3": "Dwarf 3",
+            "DWARFII": "Dwarf 2",
+            "Origin": "Celestron Origin",
+            "eVscope v1.0": "Unistellar eVscope 1 / eQuinox 1",
+            "eVscope v2.0": "Unistellar eVscope 2 / eQuinox 2",
+            "odyssey": "Unistellar Odyssey / Odyssey Pro",
         }
-        
+
         try:
             lights_dir = os.path.join(self.current_working_directory, "lights")
-            fits_files = [f for f in os.listdir(lights_dir) if f.lower().endswith(self.fits_extension)]
-            
+            fits_files = [
+                f
+                for f in os.listdir(lights_dir)
+                if f.lower().endswith(".fits") or f.lower().endswith(".fit")
+            ]
+
             if not fits_files:
                 return
-                
+
+            # Store fits files count to use later
+            self.fits_files_count = len(fits_files)
+            self.siril.log(f"Found {self.fits_files_count} FITS files in lights directory.", LogColor.BLUE)
+            # Update the label if it exists
+            if hasattr(self, "files_found_label"):
+                self.files_found_label.setText(
+                    f"Fit(s) in lights directory: {self.fits_files_count}"
+                )
+
             first_file = os.path.join(lights_dir, fits_files[0])
             with fits.open(first_file) as hdul:
                 header = hdul[0].header
-                telescope = header.get('TELESCOP', 'Seestar S30')
+                telescope = header.get("TELESCOP") or header.get(
+                    "CAMERA", "Seestar S30"
+                )
+
+                # Try to map telescope name, using startswith for partial matches
+                mapped_telescope = "ZWO Seestar S30"  # default
+                for telescope_local_name, ui_name in telescope_map.items():
+                    if telescope.startswith(telescope_local_name):
+                        mapped_telescope = ui_name
+                        break
                 
-                mapped_telescope = telescope_map.get(telescope, 'ZWO Seestar S30')
+                if mapped_telescope == "ZWO Seestar S30":
+                    origin = header.get("ORIGIN", "NULL")
+                    if origin.startswith("Unistellar"):
+                        instrume = header.get("INSTRUME", "NULL")
+                        # Dict for Unistellar
+                        unistellar_instruments = {
+                            "IMX224": "Unistellar eVscope 1 / eQuinox 1",
+                            "IMX347": "Unistellar eVscope 2 / eQuinox 2",
+                            "IMX415": "Unistellar Odyssey / Odyssey Pro",
+                        }
+                        for instrument, name in unistellar_instruments.items():
+                            if instrume.startswith(instrument):
+                                mapped_telescope = name
+                                break
+                    else:
+                        self.siril.log("Couldn't find Telescope info, setting default:", LogColor.BLUE)
+
                 self.telescope_combo.setCurrentText(mapped_telescope)
                 self.chosen_telescope = mapped_telescope
-                self.siril.log(f"Set telescope to {mapped_telescope} from FITS header", LogColor.BLUE)
-                
+                self.siril.log(
+                    f"Set telescope to {mapped_telescope} from FITS header",
+                    LogColor.BLUE,
+                )
+
         except Exception as e:
             self.siril.log(f"Error reading telescope from FITS: {e}", LogColor.SALMON)
+
+    def fixUnistellarHeaders(self, dir_name):
+        dir = os.path.join(self.current_working_directory, dir_name)
+        for file in os.listdir(dir):
+            if file.upper().endswith("STACKINPUT.FITS") or file.upper().endswith(
+                "STACKINPUT.FIT"
+            ):
+                data, hdr = fits.getdata(os.path.join(dir, file), header=True)
+                hdr.set(
+                    "RA", hdr["FOVRA"]
+                )  # add a RA header based on the FOVRA unistellar header
+                hdr.set(
+                    "DEC", hdr["FOVDEC"]
+                )  # add a DEC header based on the FOVDEC unistellar header
+                telescope = None
+                if hdr["INSTRUME"].startswith("IMX224"):  # eVscope1 or eQuinox1
+                    hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
+                    hdr.set("XPIXSZ", 3.75)  # add a XPIXSZ header
+                    hdr.set("YPIXSZ", 3.75)  # add a YPIXSZ header
+                    telescope = "eVscope v1.0"
+                if hdr["INSTRUME"].startswith("IMX347"):  # eVscope2 or eQuinox2
+                    hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
+                    hdr.set("XPIXSZ", 2.9)  # add a XPIXSZ header
+                    hdr.set("YPIXSZ", 2.9)  # add a YPIXSZ header
+                    telescope = "eVscope v2.0"
+                if hdr["INSTRUME"].startswith("IMX415"):  # Odyssey or Odyssey Pro
+                    hdr.set("FOCALLEN", 320.0)  # add a FOCALLEN header
+                    hdr.set("XPIXSZ", 2.9)  # add a XPIXSZ header
+                    hdr.set("YPIXSZ", 2.9)  # add a YPIXSZ header
+                    telescope = "Odyssey"
+
+                if hdr["SOFTVER"].startswith("4.2") and telescope.startswith(
+                    "eVscope"
+                ):  # fix for bayer issue with latest FW 4.2
+                    hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
+                    hdr.set("YBAYROFF", 1)  # add a YPIXSZ header
+                else:
+                    hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
+                    hdr.set("YBAYROFF", 0)  # add a YPIXSZ header
+
+                if hdr.get("TELESCOP") is None and telescope is not None:
+                    hdr.set(
+                        "TELESCOP", telescope
+                    )  # add a TELESCOP header for older FW version
+
+                fits.writeto(os.path.join(dir, file), data, hdr, overwrite=True)
+                # print(file)
+        self.siril.log("Unistellar headers fixed!", LogColor.GREEN)
 
     # Dirname: lights, darks, biases, flats
     def convert_files(self, dir_name):
@@ -361,7 +550,9 @@ class PreprocessingInterface(QMainWindow):
                 # return false because there's no conversion
                 return False
             try:
-                args = ["convert", dir_name, "-out=../process"]
+                # args = ["convert", dir_name, "-out=../process"]
+                # Switched to `link` command to only get fits files
+                args = ["link", dir_name, "-out=../process"]
                 # If there are no calibration frames or drizzle is off, debayer on convert, otherwise you get a monochrome image
                 # if "lights" in dir_name.lower():
                 #     if not self.darks_checkbox.isChecked() or not self.flats_checkbox.isChecked() or not self.drizzle_status:
@@ -379,12 +570,13 @@ class PreprocessingInterface(QMainWindow):
             )
             return True
         else:
-            self.siril.error_messagebox(f"Directory {directory} does not exist", True)
-            raise NoImageError(
-                (
-                    f'No directory named "{dir_name}" at this location. Make sure the working directory is correct.'
-                )
-            )
+            # self.siril.error_messagebox(f"Directory {directory} does not exist", True)
+            # raise NoImageError(
+            #     (
+            #         f'No directory named "{dir_name}" at this location. Make sure the working directory is correct.'
+            #     )
+            # )
+            self.siril.log(f'No directory named "{dir_name}" at this location. Make sure the working directory is correct. Skipping.', LogColor.SALMON)
 
     # Plate solve on sequence runs when file count < 2048
     def seq_plate_solve(self, seq_name):
@@ -393,12 +585,12 @@ class PreprocessingInterface(QMainWindow):
         args = ["seqplatesolve", seq_name]
 
         # If origin or D2, need to pass in the focal length, pixel size, and target coordinates
-        if self.chosen_telescope == "Celestron Origin":
-            args.append(self.target_coords)
-            focal_len = 335
-            pixel_size = 2.4
-            args.append(f"-focal={focal_len}")
-            args.append(f"-pixelsize={pixel_size}")
+        # if self.chosen_telescope == "Celestron Origin":
+        #     args.append(self.target_coords)
+        #     focal_len = 335
+        #     pixel_size = 2.4
+        #     args.append(f"-focal={focal_len}")
+        #     args.append(f"-pixelsize={pixel_size}")
         if self.chosen_telescope == "Dwarf 2":
             args.append(self.target_coords)
             focal_len = 100
@@ -406,38 +598,78 @@ class PreprocessingInterface(QMainWindow):
             args.append(f"-focal={focal_len}")
             args.append(f"-pixelsize={pixel_size}")
 
-        args.extend(["-nocache", "-force", "-disto=ps_distortion"])
+        args.extend(["-nocache", "-force", "-disto=ps_distortion", "-order=4"])
         # args = ["platesolve", seq_name, "-disto=ps_distortion", "-force"]
 
         try:
             self.siril.cmd(*args)
+            self.siril.log(f"Platesolved {seq_name}", LogColor.GREEN)
+            return True
         except (s.DataError, s.CommandError, s.SirilError) as e:
             self.siril.log(f"seqplatesolve failed: {e}", LogColor.RED)
-            # self.siril.error_messagebox(f"seqplatesolve failed: {e}")
-            # self.close_dialog()
-        self.siril.log(f"Platesolved {seq_name}", LogColor.GREEN)
+            return True # TODO: disabling fallback because Siril seems to be throwing a false error 
+
+    # Regular registration if plate solve not available - No Mosaics
+    def regular_register_seq(self, seq_name, drizzle_amount, pixel_fraction):
+        """Registers the sequence using the 'register' command."""
+        cmd_args = ["register", seq_name, "-2pass"]
+        if self.drizzle_status:
+            cmd_args.extend(
+                ["-drizzle", f"-scale={drizzle_amount}", f"-pixfrac={pixel_fraction}"]
+            )
+        self.siril.log(
+            "Regular Registration (Global Star Alignment) Done: " + " ".join(cmd_args),
+            LogColor.BLUE,
+        )
+
+        try:
+            self.siril.cmd(*cmd_args)
+        except (s.DataError, s.CommandError, s.SirilError) as e:
+            self.siril.log(f"Data error occurred: {e}", LogColor.RED)
+
+        self.siril.log("Registered Sequence", LogColor.GREEN)
 
     def seq_bg_extract(self, seq_name):
         """Runs the siril command 'seqsubsky' to extract the background from the plate solved files."""
         try:
-            self.siril.cmd("seqsubsky", seq_name, "1", "-samples=10")
+            self.siril.cmd("seqsubsky", seq_name, "1", "-samples=10", "-tolerance=2.0")
+            self.siril.cmd("cd", ".")  # Refresh current directory
+            self.siril.cmd("close")    # Close and reopen to flush cache
+            self.siril.cmd("cd", ".")  # Re-establish working directory
+            time.sleep(10)          # Wait for Siril to flush cache
         except (s.DataError, s.CommandError, s.SirilError) as e:
             self.siril.log(f"Seq BG Extraction failed: {e}", LogColor.RED)
             self.close_dialog()
         self.siril.log("Background extracted from Sequence", LogColor.GREEN)
 
     def seq_apply_reg(
-        self, seq_name, drizzle_amount, pixel_fraction, filter_roundness, filter_fwhm
+        self,
+        seq_name,
+        drizzle_amount,
+        pixel_fraction,
+        filter_roundness,
+        filter_fwhm,
+        filter_bg,
+        filter_star_count,
     ):
         """Apply Existing Registration to the sequence."""
         cmd_args = [
             "seqapplyreg",
             seq_name,
-            f"-filter-round={filter_roundness}k",
-            f"-filter-wfwhm={filter_fwhm}k",
             "-kernel=square",
             "-framing=max",
         ]
+
+        if self.filters_checkbox.isChecked():
+            cmd_args.extend(
+                [
+                    f"-filter-round={filter_roundness}%",
+                    f"-filter-wfwhm={filter_fwhm}%",
+                    f"-filter-bkg={filter_bg}%",
+                    f"-filter-nbstars={filter_star_count}%",
+                ]
+            )
+
         if self.drizzle_status:
             cmd_args.extend(
                 ["-drizzle", f"-scale={drizzle_amount}", f"-pixfrac={pixel_fraction}"]
@@ -485,12 +717,12 @@ class PreprocessingInterface(QMainWindow):
 
         for idx, filename in enumerate(sorted(os.listdir(folder))):
             if filename.startswith(seq_name) and filename.lower().endswith(
-                self.fits_extension
+                self.fits_extension + ".fz"
             ):
                 filepath = os.path.join(folder, filename)
                 try:
                     with fits.open(filepath) as hdul:
-                        data = hdul[0].data
+                        data = hdul[1].data
                         if data is not None and data.ndim >= 2:
                             dynamic_threshold = threshold
                             data_max = np.max(data)
@@ -627,13 +859,24 @@ class PreprocessingInterface(QMainWindow):
         cmd_args = [
             "calibrate",
             f"{seq_name}",
-            "-dark=darks_stacked" if use_darks else "",
-            "-flat=flats_stacked" if use_flats else "",
-            "-cfa -equalize_cfa",
         ]
+        
+        # Check if darks_stacked exists before adding to command
+        if use_darks and os.path.exists(
+            os.path.join(self.current_working_directory, "process", f"darks_stacked{self.fits_extension}")
+        ):
+            cmd_args.append("-dark=darks_stacked")
+            cmd_args.append("-cc=dark")
+        
+        if use_flats and os.path.exists(
+            os.path.join(self.current_working_directory, "process", f"flats_stacked{self.fits_extension}")
+        ):
+            cmd_args.append("-flat=flats_stacked")
+        
+        cmd_args.extend(["-cfa", "-equalize_cfa"])
 
         # Calibrate with -debayer if drizle is not set
-        print("Drizzle status:", self.drizzle_status)
+        self.siril.log(f"Drizzle status: {self.drizzle_status}", LogColor.BLUE)
         if not self.drizzle_status:
             cmd_args.append("-debayer")
 
@@ -645,8 +888,26 @@ class PreprocessingInterface(QMainWindow):
             self.siril.log(f"Command execution failed: {e}", LogColor.RED)
             self.close_dialog()
 
+        if "eVscope 1" in self.chosen_telescope:
+            # crop files for evscope1/equinox1 IMX224
+            cmd_args = ["seqcrop", f"pp_{seq_name}", "7 0 1296 976"]
+
+            self.siril.log(f"Running command: {' '.join(cmd_args)}", LogColor.BLUE)
+
+            try:
+                self.siril.cmd(*cmd_args)
+            except (s.DataError, s.CommandError, s.SirilError) as e:
+                self.siril.log(f"Command execution failed: {e}", LogColor.RED)
+                self.close_dialog()
+
     def seq_stack(
-        self, seq_name, feather, feather_amount, rejection=False, output_name=None
+        self,
+        seq_name,
+        feather,
+        feather_amount,
+        rejection=False,
+        output_name=None,
+        overlap_norm=False,
     ):
         """Stack it all, and feather if it's provided"""
         out = "result" if output_name is None else output_name
@@ -657,9 +918,11 @@ class PreprocessingInterface(QMainWindow):
             " rej 3 3" if rejection else " rej none",
             "-norm=addscale",
             "-output_norm",
+            "-overlap_norm" if overlap_norm else "",
             "-rgb_equal",
             "-maximize",
             "-filter-included",
+            "-32b",
             f"-out={out}",
         ]
         if feather:
@@ -676,7 +939,12 @@ class PreprocessingInterface(QMainWindow):
         self.siril.log(f"Running command: {' '.join(cmd_args)}", LogColor.BLUE)
 
         try:
+            # Turn off compression for stacking 
+            self.siril.cmd("setcompress", "0")
             self.siril.cmd(*cmd_args)
+            # Turn compression back on after stacking
+            if UI_DEFAULTS["enable_compression"]:
+                self.siril.cmd("setcompress", "1 -type=rice 16")
         except (s.DataError, s.CommandError, s.SirilError) as e:
             self.siril.log(f"Stacking failed: {e}", LogColor.RED)
             self.close_dialog()
@@ -689,8 +957,8 @@ class PreprocessingInterface(QMainWindow):
         current_datetime = datetime.now().strftime("%Y-%m-%d_%H%M")
 
         # Default filename
-        drizzle_str = str(self.drizzle_factor).replace(".", "-")
-        file_name = f"result__drizzle-{drizzle_str}x__{current_datetime}{suffix}"
+        drizzle_str = str(round(self.drizzle_factor, 2)).replace(".", "-")
+        file_name = f"result_drizzle-{drizzle_str}x_{current_datetime}{suffix}"
 
         # Get header info from loaded image for filename
         current_fits_headers = self.siril.get_image_fits_header(return_as="dict")
@@ -710,9 +978,9 @@ class PreprocessingInterface(QMainWindow):
 
         file_name = f"{object_name}_{stack_count:03d}x{exptime}sec_{date_obs_str}"
         if self.drizzle_status:
-            file_name += f"__drizzle-{drizzle_str}x"
+            file_name += f"_drizzle-{drizzle_str}x"
 
-        file_name += f"__{current_datetime}{suffix}"
+        file_name += f"_{current_datetime}{suffix}"
 
         try:
             self.siril.cmd("setcompress", "0")
@@ -750,44 +1018,85 @@ class PreprocessingInterface(QMainWindow):
         catalog="localgaia",
         whiteref="Average Spiral Galaxy",
     ):
-        if oscsensor == "Unistellar Evscope 2":
-            self.siril.cmd("pcc", f"-catalog={catalog}")
-            self.siril.log(
-                "PCC'd Image, SPCC Unavailable for Evscope 2", LogColor.GREEN
-            )
+
+        recoded_sensor = oscsensor
+        """SPCC with oscsensor, filter, catalog, and whiteref."""
+        if oscsensor in ["Dwarf 3"]:
+            recoded_sensor = "Sony IMX678"
+        elif oscsensor in ["Dwarf Mini"]:
+            recoded_sensor = "Sony IMX662"
+        elif "eVscope 1" in oscsensor:
+            recoded_sensor = "Sony IMX224"
+        elif "eVscope 2" in oscsensor:
+            recoded_sensor = "Sony IMX415" # very similar to IMX347
+        elif "Odyssey" in oscsensor:
+            recoded_sensor = "Sony IMX415"
         else:
             recoded_sensor = oscsensor
-            """SPCC with oscsensor, filter, catalog, and whiteref."""
-            if oscsensor in ["Dwarf 3"]:
-                recoded_sensor = "Sony IMX678"
-            else:
-                recoded_sensor = oscsensor
 
-            args = [
-                f"-oscsensor={recoded_sensor}",
-                f"-catalog={catalog}",
-                f"-whiteref={whiteref}",
-            ]
+        args = [
+            f"-oscsensor={recoded_sensor}",
+            f"-catalog={catalog}",
+            f"-whiteref={whiteref}",
+        ]
 
-            # Add filter-specific arguments
-            filter_args = FILTER_COMMANDS_MAP.get(oscsensor, {}).get(filter)
-            if filter_args:
-                args.extend(filter_args)
-            else:
-                # Default to UV/IR Block
-                args.append("-oscfilter=UV/IR Block")
+        # Add filter-specific arguments
+        filter_args = FILTER_COMMANDS_MAP.get(oscsensor, {}).get(filter)
+        if filter_args:
+            args.extend(filter_args)
+        else:
+            # Default to UV/IR Block
+            args.append("-oscfilter=UV/IR Block")
 
-            # Double Quote each argument due to potential spaces
-            quoted_args = [f'"{arg}"' for arg in args]
-            try:
-                self.siril.cmd("spcc", *quoted_args)
-            except (s.CommandError, s.DataError, s.SirilError) as e:
-                self.siril.log(f"SPCC execution failed: {e}", LogColor.RED)
-                self.close_dialog()
+        # Double Quote each argument due to potential spaces
+        quoted_args = [f'"{arg}"' for arg in args]
+        try:
+            self.siril.cmd("spcc", *quoted_args)
+        except (s.CommandError, s.DataError, s.SirilError) as e:
+            self.siril.log(f"SPCC execution failed: {e}", LogColor.RED)
+            self.close_dialog()
 
-            img = self.save_image("_spcc")
-            self.siril.log(f"Saved SPCC'd image: {img}", LogColor.GREEN)
-            return img
+        img = self.save_image("_spcc")
+        self.siril.log(f"Saved SPCC'd image: {img}", LogColor.GREEN)
+        return img
+
+    def stacking_details(self):
+        """Logs stacking details like number of frames, rejection method, feathering, and drizzle."""
+        try:
+            headers = self.siril.get_image_fits_header(return_as="dict")
+            object_name = headers.get("OBJECT", "Unknown")
+            exposure_time = headers.get("EXPTIME", "Unknown")
+            telescope = headers.get("TELESCOP") or headers.get("INSTRUME", "Unknown")
+            total_integration = headers.get("LIVETIME", "Unknown")
+            num_frames = headers.get("STACKCNT", "Unknown")
+            filter = headers.get("FILTER", "Unknown")
+            focallen = headers.get("FOCALLEN", "Unknown")
+            aperture = headers.get("APERTURE", "Unknown")
+            date_obs = headers.get("DATE-OBS", "Unknown")
+            date = headers.get("DATE", "Unknown")
+            pixel_size = headers.get("XPIXSZ", "Unknown")
+            feathering = self.feather_amount_spinbox.value() if self.feather_checkbox.isChecked() else "Off"
+            drizzle = f"{self.drizzle_factor}x" if self.drizzle_status else "Off"
+
+            details_msg = (
+                f"Stacking Details:\n"
+                f"Object: {object_name}\n"
+                f"Telescope: {telescope}\n"
+                f"Observation Date: {date_obs}\n"
+                f"Processing Date: {date}\n"
+                f"Filter: {filter}\n"
+                f"Number of Frames: {num_frames}\n"
+                f"Exposure Time: {exposure_time}s\n"
+                f"Total Integration: {total_integration}s\n"
+                f"Focal Length: {round(focallen, 2)}mm\n"
+                f"Aperture: {aperture}\n"
+                f"Pixel Size: {round(pixel_size, 2)}µm\n"
+                f"Feathering: {feathering}\n"
+                f"Drizzle: {drizzle}"
+            )
+            self.siril.log(details_msg, LogColor.BLUE)
+        except Exception as e:
+            self.siril.log(f"Error retrieving stacking details: {e}", LogColor.SALMON)
 
     def load_image(self, image_name):
         """Loads the result."""
@@ -818,22 +1127,31 @@ class PreprocessingInterface(QMainWindow):
             process_dir = os.path.join(self.current_working_directory, "process")
         else:
             process_dir = self.current_working_directory
-        for f in os.listdir(process_dir):
-            # Skip the stacked file
-            name, ext = os.path.splitext(f.lower())
-            if name in (f"{prefix}_stacked", "result") and ext in (self.fits_extension):
-                continue
+        try:
+            if not os.path.isdir(process_dir):
+                self.siril.log(f"Process directory not found: {process_dir}", LogColor.SALMON)
+                return
+            
+            for f in os.listdir(process_dir):
+                # Skip the stacked file
+                name, ext = os.path.splitext(f.lower())
+                if name in (f"{prefix}_stacked", "result") and ext in (self.fits_extension, self.fits_extension + ".fz"):
+                    continue
 
-            # Check if file starts with prefix_ or pp_flats_
-            if (
-                f.startswith(prefix)
-                or f.startswith(f"{prefix}_")
-                or f.startswith("pp_flats_")
-            ):
-                file_path = os.path.join(process_dir, f)
-                if os.path.isfile(file_path):
-                    # print(f"Removing: {file_path}")
-                    os.remove(file_path)
+                # Check if file starts with prefix_ or pp_flats_
+                if (
+                    f.startswith(prefix)
+                    or f.startswith(f"{prefix}_")
+                    or f.startswith("pp_flats_")
+                ):
+                    file_path = os.path.join(process_dir, f)
+                    if os.path.isfile(file_path):
+                        try:
+                            os.remove(file_path)
+                        except OSError as e:
+                            self.siril.log(f"Failed to delete {file_path}: {e}", LogColor.SALMON)
+        except Exception as e:
+            self.siril.log(f"Error during cleanup: {e}", LogColor.SALMON)
         self.siril.log(f"Cleaned up {prefix}", LogColor.BLUE)
 
     @Slot(str)
@@ -851,13 +1169,27 @@ class PreprocessingInterface(QMainWindow):
         if new_options:
             self.filter_combo.setCurrentText(new_options[0])
 
+        # If photometry Gaia is not available, disable SPCC
+        # if not self.photometry_gaia_available:
+        #     self.spcc_checkbox.setChecked(False)
+        #     self.spcc_checkbox.setEnabled(False)
+        #     print("diabled")
+        # Disable SPCC for Celestron Origin
+        elif selected_scope == "Celestron Origin":
+            self.spcc_checkbox.setChecked(False)
+            self.spcc_checkbox.setEnabled(False)
+            self.siril.log(
+                "SPCC cannot be run on Celestron Origin automatically. It must be done manually.",
+                LogColor.SALMON,
+            )
+        else:
+            self.spcc_checkbox.setEnabled(True)
         # Update enabled state based on SPCC checkbox
         self.filter_combo.setEnabled(self.spcc_checkbox.isChecked())
 
     def show_help(self):
         help_text = (
-            f"Author: {AUTHOR} ({WEBSITE})\n"
-            f"Youtube: {YOUTUBE}\n"
+            f"Author: {AUTHOR} ({WEBSITE}); Youtube: {YOUTUBE}\n"
             "Discord: https://discord.gg/yXKqrawpjr\n"
             "Patreon: https://www.patreon.com/c/naztronomy\n"
             "Buy me a Coffee: https://www.buymeacoffee.com/naztronomy\n\n"
@@ -865,11 +1197,12 @@ class PreprocessingInterface(QMainWindow):
             '1. Must have a "lights" subdirectory inside of the working directory.\n'
             "2. For Calibration frames, you can have one or more of the following types: darks, flats, biases.\n"
             "3. If only one calibration frame is present, it will be treated as a master frame.\n"
-            f"4. If on Windows and you have more than the default {UI_DEFAULTS['max_files_per_batch']} files, this script will automatically split them into batches. You can change the batching count from 100 to 2000.\n"
-            "5. If batching, intermediary files are cleaned up automatically even if 'clean up files' is unchecked.\n"
-            "6. If batching, the frames are automatically feathered during the final stack even if 'feather' is unchecked.\n"
-            "7. Drizzle increases processing time. Higher the drizzle the longer it takes.\n"
-            "8. When asking for help, please have the logs handy."
+            "4. Local Gaia catalog is required for mosaics!\n"
+            f"5. If you have more than the default {self.max_files_per_batch} files, this script will automatically split them into batches. You can change the batching count from 50 to {self.max_files_per_batch}.\n"
+            "6. If batching, intermediary files are cleaned up automatically even if 'clean up files' is unchecked.\n"
+            "7. If batching, the frames are automatically feathered during the final stack even if 'feather' is unchecked.\n"
+            "8. Drizzle increases processing time. Higher the drizzle the longer it takes.\n"
+            "9. When asking for help, please have the logs handy."
         )
 
         # Show help in Qt message box
@@ -898,6 +1231,33 @@ class PreprocessingInterface(QMainWindow):
         # Current working directory label
         self.cwd_label = QLabel(self.cwd_label_text)
         main_layout.addWidget(self.cwd_label)
+
+        # Catalog status section
+        gaia_status_section = QGroupBox("Local Gaia Catalog Status")
+        gaia_status_layout = QHBoxLayout(gaia_status_section)
+        gaia_status_layout.setSpacing(15)
+
+        if self.astrometry_gaia_available:
+            astrometry_gaia_label = QLabel("✓ Local Astrometry Gaia Available")
+            astrometry_gaia_label.setStyleSheet("color: green;")
+            astrometry_gaia_label.setToolTip(f"Local Astrometry Gaia found at: {self.astrometry_gaia_status}")
+        else:
+            astrometry_gaia_label = QLabel("✗ Local Astrometry Gaia")
+            astrometry_gaia_label.setStyleSheet("color: red;")
+            astrometry_gaia_label.setToolTip("Local Astrometry Gaia not available - mosaics will not be generated")
+        gaia_status_layout.addWidget(astrometry_gaia_label)
+
+        if self.photometry_gaia_available:
+            photometry_gaia_label = QLabel("✓ Local Photometry Gaia Available")
+            photometry_gaia_label.setStyleSheet("color: green;")
+            photometry_gaia_label.setToolTip(f"Local Photometry Gaia found at: {self.photometry_gaia_status}")
+        else:
+            photometry_gaia_label = QLabel("✗ Local Photometry Gaia")
+            photometry_gaia_label.setStyleSheet("color: orange;")
+            photometry_gaia_label.setToolTip("Local Photometry Gaia not available, will default to Online Gaia.")
+        gaia_status_layout.addWidget(photometry_gaia_label)
+
+        main_layout.addWidget(gaia_status_section)
 
         # Telescope section
         telescope_section = QGroupBox("Telescope")
@@ -979,19 +1339,21 @@ class PreprocessingInterface(QMainWindow):
         batch_size_tooltip = (
             "Maximum number of files to process in each batch. Windows only. This is ignored on Mac/Linux."
             "This is an advanced option. Only change if you are comfortable with it.\n"
-            "Valid range: 100–2000."
+            "Valid range: 50–2000."
         )
         batch_size_label.setToolTip(batch_size_tooltip)
         preprocessing_layout.addWidget(batch_size_label, 0, 0)
 
         self.batch_size_spinbox = QSpinBox()
-        self.batch_size_spinbox.setRange(100, 2000)  # clamps input to 100–2000
-        self.batch_size_spinbox.setValue(UI_DEFAULTS["max_files_per_batch"])
+        self.batch_size_spinbox.setToolTip(batch_size_tooltip) 
+        self.batch_size_spinbox.setRange(50, self.max_files_per_batch)  # clamps input based on OS
+        self.batch_size_spinbox.setValue(self.max_files_per_batch)
         self.batch_size_spinbox.setSingleStep(50)  # allow picking any integer
-        self.batch_size_spinbox.setMinimumWidth(120)
-
-        self.batch_size_spinbox.setToolTip(batch_size_tooltip)
         preprocessing_layout.addWidget(self.batch_size_spinbox, 0, 1)
+        # Files found label
+        self.files_found_label = QLabel()
+        self.files_found_label.setToolTip("Number of Fit(s) files found in the lights directory.")
+        preprocessing_layout.addWidget(self.files_found_label, 0, 2, 1, 4)
 
         bg_extract_label = QLabel("Background Extraction:")
         bg_extract_label.setFont(title_font)
@@ -1037,6 +1399,7 @@ class PreprocessingInterface(QMainWindow):
         preprocessing_layout.addWidget(pixel_fraction_label, 3, 2)
 
         self.pixel_fraction_spinbox = QDoubleSpinBox()
+        self.pixel_fraction_spinbox.setDecimals(2)
         self.pixel_fraction_spinbox.setRange(0.1, 10.0)
         self.pixel_fraction_spinbox.setSingleStep(0.01)
         self.pixel_fraction_spinbox.setValue(UI_DEFAULTS["pixel_fraction"])
@@ -1050,48 +1413,97 @@ class PreprocessingInterface(QMainWindow):
 
         # Add spinboxes for roundness and FWHM filters
 
+        filter_label = QLabel("Filters:")
+        filter_label.setFont(title_font)
+        filter_label.setToolTip("Options for filtering images before stacking.")
+        preprocessing_layout.addWidget(filter_label, 4, 0)
+
         filters_checkbox_tooltip = (
             "Options for filtering images based on various criteria."
         )
-        self.filters_checkbox = QCheckBox("Filters")
+        self.filters_checkbox = QCheckBox("Enable")
         self.filters_checkbox.setToolTip(filters_checkbox_tooltip)
         preprocessing_layout.addWidget(self.filters_checkbox, 4, 1)
 
-        roundness_label_tooltip = "Filters images by star roundness, calculated using the second moments of detected stars. \nA lower roundness value applies a stricter filter, keeping only frames with well-defined, circular stars. Higher roundness values allow more variation in star shapes."
+        # Roundness Filter
+        roundness_label_tooltip = "Filters images by star roundness, calculated using the second moments of detected stars. \nA lower percentage keeps only frames with more circular stars. Higher percentages allow more variation in star shapes."
         roundness_label = QLabel("Roundness:")
+        roundness_label.setFont(title_font)
         roundness_label.setToolTip(roundness_label_tooltip)
         preprocessing_layout.addWidget(roundness_label, 4, 2)
 
         self.roundness_spinbox = QDoubleSpinBox()
-        self.roundness_spinbox.setRange(0.1, 5.0)
+        self.roundness_spinbox.setRange(1.0, 100.0)
         self.roundness_spinbox.setSingleStep(0.1)
-        self.roundness_spinbox.setDecimals(1)
-        self.roundness_spinbox.setValue(3.0)
+        self.roundness_spinbox.setDecimals(2)
+        self.roundness_spinbox.setValue(100.0)
         self.roundness_spinbox.setMinimumWidth(80)
-        self.roundness_spinbox.setSuffix(" σ")
+        self.roundness_spinbox.setSuffix(" %")
         self.roundness_spinbox.setEnabled(False)
         self.roundness_spinbox.setToolTip(roundness_label_tooltip)
         preprocessing_layout.addWidget(self.roundness_spinbox, 4, 3)
 
         self.filters_checkbox.toggled.connect(self.roundness_spinbox.setEnabled)
 
-        fwhm_label_tooltip = "Filters images by weighted Full Width at Half Maximum (FWHM), calculated using star sharpness. \nA lower sigma value applies a stricter filter, keeping only frames close to the median FWHM. Higher sigma allows more variation."
-        fwhm_label = QLabel("Weighted FWHM:")
+        # FWHM Filter
+        fwhm_label_tooltip = "Filters images by weighted Full Width at Half Maximum (FWHM), calculated using star sharpness. \nA lower percentage keeps only frames with consistent FWHM values. Higher percentages allow more variation."
+        fwhm_label = QLabel("FWHM:")
+        fwhm_label.setFont(title_font)
         fwhm_label.setToolTip(fwhm_label_tooltip)
-        preprocessing_layout.addWidget(fwhm_label, 5, 2)
+        preprocessing_layout.addWidget(fwhm_label, 4, 4)
 
         self.fwhm_spinbox = QDoubleSpinBox()
-        self.fwhm_spinbox.setRange(0.1, 5.0)
+        self.fwhm_spinbox.setRange(1.0, 100.0)
         self.fwhm_spinbox.setSingleStep(0.1)
-        self.fwhm_spinbox.setDecimals(1)
-        self.fwhm_spinbox.setValue(3.0)
+        self.fwhm_spinbox.setDecimals(2)
+        self.fwhm_spinbox.setValue(100.0)
         self.fwhm_spinbox.setMinimumWidth(80)
-        self.fwhm_spinbox.setSuffix(" σ")
+        self.fwhm_spinbox.setSuffix(" %")
         self.fwhm_spinbox.setEnabled(False)
         self.fwhm_spinbox.setToolTip(fwhm_label_tooltip)
-        preprocessing_layout.addWidget(self.fwhm_spinbox, 5, 3)
+        preprocessing_layout.addWidget(self.fwhm_spinbox, 4, 5)
 
         self.filters_checkbox.toggled.connect(self.fwhm_spinbox.setEnabled)
+
+        # Background Filter
+        bg_filter_label = QLabel("Background:")
+        bg_filter_label.setFont(title_font)
+        bg_filter_tooltip = "Filter frames by background value. Lower percentages keep frames with lower background levels."
+        bg_filter_label.setToolTip(bg_filter_tooltip)
+        preprocessing_layout.addWidget(bg_filter_label, 5, 2)
+
+        self.bg_filter_spinbox = QDoubleSpinBox()
+        self.bg_filter_spinbox.setRange(1.0, 100.0)
+        self.bg_filter_spinbox.setSingleStep(0.1)
+        self.bg_filter_spinbox.setDecimals(2)
+        self.bg_filter_spinbox.setValue(100.0)
+        self.bg_filter_spinbox.setMinimumWidth(80)
+        self.bg_filter_spinbox.setSuffix(" %")
+        self.bg_filter_spinbox.setEnabled(False)
+        self.bg_filter_spinbox.setToolTip(bg_filter_tooltip)
+        preprocessing_layout.addWidget(self.bg_filter_spinbox, 5, 3)
+
+        # Star Count Filter
+        star_count_filter_label = QLabel("Star Count:")
+        star_count_filter_label.setFont(title_font)
+        star_count_filter_tooltip = "Filter frames by star count. Lower percentages keep frames with fewer stars."
+        star_count_filter_label.setToolTip(star_count_filter_tooltip)
+        preprocessing_layout.addWidget(star_count_filter_label, 5, 4)
+
+        self.star_count_filter_spinbox = QDoubleSpinBox()
+        self.star_count_filter_spinbox.setRange(1.0, 100.0)
+        self.star_count_filter_spinbox.setSingleStep(0.1)
+        self.star_count_filter_spinbox.setDecimals(2)
+        self.star_count_filter_spinbox.setValue(100.0)
+        self.star_count_filter_spinbox.setMinimumWidth(80)
+        self.star_count_filter_spinbox.setSuffix(" %")
+        self.star_count_filter_spinbox.setEnabled(False)
+        self.star_count_filter_spinbox.setToolTip(star_count_filter_tooltip)
+        preprocessing_layout.addWidget(self.star_count_filter_spinbox, 5, 5)
+
+        # Connect the filters checkbox to enable/disable all filter controls
+        self.filters_checkbox.toggled.connect(self.bg_filter_spinbox.setEnabled)
+        self.filters_checkbox.toggled.connect(self.star_count_filter_spinbox.setEnabled)
 
         # Stacking options
         stacking_label = QLabel("Stacking:")
@@ -1132,6 +1544,8 @@ class PreprocessingInterface(QMainWindow):
         spcc_layout.setContentsMargins(10, 15, 10, 10)
 
         spcc_tooltip = "SPCC uses star colors to calibrate the image colors. Recommended for accurate color reproduction."
+        # if not self.photometry_gaia_available:
+        #     spcc_tooltip += " Disabled because Local Photometry catalog not available."
         self.spcc_checkbox = QCheckBox(
             "Enable Spectrophotometric Color Calibration (SPCC)"
         )
@@ -1154,39 +1568,30 @@ class PreprocessingInterface(QMainWindow):
         )
         spcc_layout.addWidget(self.filter_combo, 1, 1)
 
-        catalog_label = QLabel("Catalog:")
-        catalog_label.setFont(title_font)
-        catalog_tooltip = "Source of star color data. Local Gaia is faster but requires downloaded catalog. Online Gaia works without local catalog but is slower and often crashes."
-        catalog_label.setToolTip(catalog_tooltip)
-        spcc_layout.addWidget(catalog_label, 2, 0)
-
-        self.catalog_combo = QComboBox()
-        catalog_options = ["localgaia", "gaia"]
-        self.catalog_combo.addItems(catalog_options)
-        self.catalog_combo.setCurrentText("localgaia")
-        self.catalog_combo.setEnabled(False)
-        self.catalog_combo.setToolTip(catalog_tooltip)
-        spcc_layout.addWidget(self.catalog_combo, 2, 1)
-
         # Connect SPCC checkbox to enable/disable filter and catalog combos
         self.spcc_checkbox.toggled.connect(self.filter_combo.setEnabled)
-        self.spcc_checkbox.toggled.connect(self.catalog_combo.setEnabled)
 
-        if self.gaia_catalogue_available:
-            gaia_status_label = QLabel("✓ Local Gaia Available")
-            gaia_status_label.setStyleSheet("color: green;")
-            spcc_layout.addWidget(gaia_status_label, 2, 2)
-        else:
-            gaia_status_label = QLabel("✗ Local Gaia Not available")
-            gaia_status_label.setStyleSheet("color: red;")
-            spcc_layout.addWidget(gaia_status_label, 2, 2)
+        # self.spcc_checkbox.toggled.connect(self.catalog_combo.setEnabled)
 
         self.scan_blackframes_checkbox = QCheckBox("Black Frames Bug?")
         self.scan_blackframes_checkbox.setToolTip(
-            "Enable this option to automatically scan for black frames in your image sequence ONLY If you see black frames as a result of drizzle." \
+            "Enable this option to automatically scan for black frames in your image sequence ONLY If you see black frames as a result of drizzle."
             "\nWhen the bug is confirmed fixed, this option and check will be removed."
         )
         spcc_layout.addWidget(self.scan_blackframes_checkbox, 3, 0, 1, 2)
+
+        # Warning message for feather checkbox
+        feather_warning = QLabel(
+            "⚠ You enabled feather, this can cause slow processing and memory issues. If you get an error, turn it off and try again.\nSupport will not be provided for feather-related issues. ⚠"
+        )
+        feather_warning.setStyleSheet("color: red;")
+        feather_warning.setWordWrap(True)
+        feather_warning.setVisible(False)  # Hidden by default
+        spcc_layout.addWidget(feather_warning, 4, 0, 1, 2)
+
+        # Connect feather checkbox to show/hide warning
+        self.feather_checkbox.toggled.connect(feather_warning.setVisible)
+        self.feather_checkbox.toggled.connect(self.adjustSize)
 
         # Buttons section
         button_layout = QHBoxLayout()
@@ -1198,18 +1603,24 @@ class PreprocessingInterface(QMainWindow):
         help_button = QPushButton("Help")
         help_button.setMinimumWidth(50)
         help_button.setMinimumHeight(35)
+        help_button.setToolTip("Show help information and frequently asked questions")
+        # help_button.setStyleSheet("QPushButton { background-color: #6103c7; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #9434fc; }")
         help_button.clicked.connect(self.show_help)
         button_layout.addWidget(help_button)
 
         save_presets_button = QPushButton("Save Presets")
         save_presets_button.setMinimumWidth(80)
         save_presets_button.setMinimumHeight(35)
+        save_presets_button.setToolTip("Save current settings to a \"naztronomy_smart_scope_presets.json\" file in the presets directory")
+        # save_presets_button.setStyleSheet("QPushButton { background-color: #6103c7; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #9434fc; }")
         save_presets_button.clicked.connect(self.save_presets)
         button_layout.addWidget(save_presets_button)
 
         load_presets_button = QPushButton("Load Presets")
         load_presets_button.setMinimumWidth(80)
         load_presets_button.setMinimumHeight(35)
+        load_presets_button.setToolTip("Load previously saved presets. If \"presets/naztronomy_smart_scope_presets.json\" exists, it will load first, otherwise it'll prompt you to find a proper .json file.")
+        # load_presets_button.setStyleSheet("QPushButton { background-color: #6103c7; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #9434fc; }")
         load_presets_button.clicked.connect(self.load_presets)
         button_layout.addWidget(load_presets_button)
 
@@ -1218,6 +1629,7 @@ class PreprocessingInterface(QMainWindow):
         close_button = QPushButton("Close")
         close_button.setMinimumWidth(100)
         close_button.setMinimumHeight(35)
+        close_button.setStyleSheet("QPushButton { background-color: #c70306; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #fc3437; }")
         close_button.clicked.connect(self.close_dialog)
         button_layout.addWidget(close_button)
 
@@ -1227,7 +1639,7 @@ class PreprocessingInterface(QMainWindow):
         run_button = QPushButton("Run")
         run_button.setMinimumWidth(100)
         run_button.setMinimumHeight(35)
-        run_button.setStyleSheet("QPushButton { font-weight: bold; }")
+        run_button.setStyleSheet("QPushButton { background-color: #0078cc; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #33abff; }")
         run_button.clicked.connect(self.on_run_clicked)
         button_layout.addWidget(run_button)
 
@@ -1258,17 +1670,19 @@ class PreprocessingInterface(QMainWindow):
             do_spcc=self.spcc_checkbox.isChecked(),
             filter=self.filter_combo.currentText(),
             telescope=self.telescope_combo.currentText(),
-            catalog=self.catalog_combo.currentText(),
+            # catalog=self.catalog_combo.currentText(),
             use_darks=self.darks_checkbox.isChecked(),
             use_flats=self.flats_checkbox.isChecked(),
             use_biases=self.biases_checkbox.isChecked(),
             max_files_per_batch=self.batch_size_spinbox.value(),
             bg_extract=self.bg_extract_checkbox.isChecked(),
             drizzle=self.drizzle_checkbox.isChecked(),
-            drizzle_amount=self.drizzle_amount_spinbox.value(),
-            pixel_fraction=self.pixel_fraction_spinbox.value(),
-            filter_roundness=self.roundness_spinbox.value(),
-            filter_fwhm=self.fwhm_spinbox.value(),
+            drizzle_amount=round(self.drizzle_amount_spinbox.value(), 2),
+            pixel_fraction=round(self.pixel_fraction_spinbox.value(), 2),
+            filter_roundness=round(self.roundness_spinbox.value(),2),
+            filter_fwhm=round(self.fwhm_spinbox.value(), 2),
+            filter_bg=round(self.bg_filter_spinbox.value(), 2),
+            filter_star_count=round(self.star_count_filter_spinbox.value(), 2),
             feather=self.feather_checkbox.isChecked(),
             feather_amount=self.feather_amount_spinbox.value(),
             clean_up_files=self.cleanup_files_checkbox.isChecked(),
@@ -1297,7 +1711,7 @@ class PreprocessingInterface(QMainWindow):
             return
 
         first_file = matching_files[0]
-        print(first_file)
+        self.siril.log(f"Extracting Coordinates from file: {first_file}", LogColor.BLUE)
         file_path = os.path.join(process_dir, first_file)
 
         try:
@@ -1305,6 +1719,10 @@ class PreprocessingInterface(QMainWindow):
                 header = hdul[0].header
                 ra = header.get("RA")
                 dec = header.get("DEC")
+
+                if ra is None:
+                    ra = header.get("FOVRA")
+                    dec = header.get("FOVDEC")
 
                 if ra is not None and dec is not None:
                     self.target_coords = f"{ra},{dec}"
@@ -1319,49 +1737,6 @@ class PreprocessingInterface(QMainWindow):
         except Exception as e:
             self.siril.log(f"Error reading FITS header: {e}", LogColor.RED)
 
-    # TODO: Remove function in RC1
-    def swap_red_blue_channels(self, image_path):
-        """Swaps the red and blue channels of a FITS image to mitigate Siril bug for seestars"""
-        try:
-            self.siril.log(
-                "Swapping red and blue channels using Python...", LogColor.BLUE
-            )
-
-            # Read the FITS file
-            with fits.open(image_path) as hdul:
-                data = hdul[0].data.copy()
-                header = hdul[0].header.copy()
-
-                if data.ndim == 3 and data.shape[0] == 3:
-                    # Swap channels: [R, G, B] -> [B, G, R]
-                    data[[0, 2]] = data[[2, 0]]
-
-                    base_name = os.path.splitext(image_path)[0]
-                    output_path = f"{base_name}_RBswapped{self.fits_extension}"
-
-                    hdul_out = fits.PrimaryHDU(data=data, header=header)
-                    hdul_out.writeto(output_path, overwrite=True)
-
-                    self.siril.log(
-                        f"Successfully swapped channels and saved: {output_path}",
-                        LogColor.GREEN,
-                    )
-                    return output_path
-
-                else:
-                    self.siril.log(
-                        f"Image is not a 3-channel color image (shape: {data.shape})",
-                        LogColor.SALMON,
-                    )
-                    return None
-
-        except Exception as e:
-            self.siril.log(
-                f"Color channel swap failed, may not mean anything: {e}",
-                LogColor.SALMON,
-            )
-            return None
-
     def batch(
         self,
         output_name: str,
@@ -1372,8 +1747,10 @@ class PreprocessingInterface(QMainWindow):
         drizzle: bool = False,
         drizzle_amount: float = UI_DEFAULTS["drizzle_amount"],
         pixel_fraction: float = UI_DEFAULTS["pixel_fraction"],
-        filter_roundness: float = 3.0,
-        filter_fwhm: float = 3.0,
+        filter_roundness: float = 100.0,
+        filter_fwhm: float = 100.0,
+        filter_bg: float = 100.0,
+        filter_star_count: float = 100.0,
         feather: bool = False,
         feather_amount: float = UI_DEFAULTS["feather_amount"],
         clean_up_files: bool = False,
@@ -1385,6 +1762,9 @@ class PreprocessingInterface(QMainWindow):
 
         self.drizzle_status = drizzle
         self.drizzle_factor = drizzle_amount
+
+        if self.chosen_telescope.startswith("Unistellar"):
+            self.fixUnistellarHeaders(dir_name=output_name)
 
         # Output name is actually the name of the batched working directory
         self.convert_files(dir_name=output_name)
@@ -1409,6 +1789,8 @@ class PreprocessingInterface(QMainWindow):
                     f"Error during cleanup after calibration: {e}", LogColor.SALMON
                 )
             seq_name = "pp_" + seq_name
+            if "eVscope 1" in self.chosen_telescope:
+                seq_name = "cropped_" + seq_name
 
         if bg_extract:
             self.seq_bg_extract(seq_name=seq_name)
@@ -1421,7 +1803,30 @@ class PreprocessingInterface(QMainWindow):
         if self.chosen_telescope in ["Celestron Origin", "Dwarf 2"]:
             self.extract_coords_from_fits(prefix=seq_name)
 
-        self.seq_plate_solve(seq_name=seq_name)
+        # Only do plate solve if local gaia is available!
+        if not self.astrometry_gaia_available:
+            self.siril.log(
+                "Local Gaia catalogue not available, skipping plate solving. Mosaics will NOT be automatically created.",
+                LogColor.SALMON,
+            )
+            self.regular_register_seq(
+                seq_name=seq_name,
+                drizzle_amount=drizzle_amount,
+                pixel_fraction=pixel_fraction,
+            )
+        else:
+            individual_plate_solve_status = self.seq_plate_solve(seq_name=seq_name)
+            if not individual_plate_solve_status:
+                self.siril.log(
+                    "Plate solving failed, falling back to regular registration.",
+                    LogColor.SALMON,
+                )
+                self.regular_register_seq(
+                    seq_name=seq_name,
+                    drizzle_amount=drizzle_amount,
+                    pixel_fraction=pixel_fraction,
+                )
+
         # seq_name stays the same after plate solve
         self.seq_apply_reg(
             seq_name=seq_name,
@@ -1429,6 +1834,8 @@ class PreprocessingInterface(QMainWindow):
             pixel_fraction=pixel_fraction,
             filter_roundness=filter_roundness,
             filter_fwhm=filter_fwhm,
+            filter_bg=filter_bg,
+            filter_star_count=filter_star_count,
         )
         if clean_up_files:
             self.clean_up(
@@ -1436,17 +1843,35 @@ class PreprocessingInterface(QMainWindow):
             )  # Clean up bkg_ files or pp_ if flat calibrated, otherwise lights_
         seq_name = f"r_{seq_name}"
 
-        if drizzle:
-            if self.scan_blackframes_checkbox.isChecked():
-                self.scan_black_frames(seq_name=seq_name)
+        try:
+            if drizzle:
+                if self.scan_blackframes_checkbox.isChecked():
+                    self.scan_black_frames(seq_name=seq_name)
+        except (s.DataError, s.CommandError, s.SirilError) as e:
+            self.siril.log(
+                f"Data error occurred during black frame scan: {e}", LogColor.RED
+            )
 
-        self.seq_stack(
-            seq_name=seq_name,
-            feather=feather,
-            feather_amount=feather_amount,
-            rejection=True,
-            output_name=output_name,
-        )
+        try:
+            self.seq_stack(
+                seq_name=seq_name,
+                feather=feather,
+                feather_amount=feather_amount,
+                rejection=True,
+                output_name=output_name,
+                overlap_norm=False,
+            )
+        except (s.DataError, s.CommandError, s.SirilError) as e:
+            self.siril.log(
+                f"Error occurred during stacking: {e}", LogColor.RED
+            )
+            if feather:
+                QMessageBox.warning(
+                    self,
+                    "Stacking Error",
+                    "There was an error during the stacking process which could have been caused by feathering. Please uncheck the feather option and try again.",
+                )
+            return None
 
         if clean_up_files:
             self.clean_up(prefix=seq_name)  # clean up r_ files
@@ -1474,61 +1899,13 @@ class PreprocessingInterface(QMainWindow):
 
         return file_name
 
-    def unselect_bad_fits(self, seq_name, folder="process"):
-        """
-        Checks all FITS files in the given folder with the given prefix
-        for integrity and unselects any bad ones in the current sequence
-        in Siril.
-
-        Parameters
-        ----------
-        seq_name : str
-            The prefix of the sequence to check.
-        folder : str, optional
-            The folder to check for FITS files. Defaults to "process".
-
-        Returns
-        -------
-        None
-        """
-        self.siril.log("Checking for bad FITS files...", LogColor.BLUE)
-        bad_fits = []
-        all_files = sorted(
-            [
-                f
-                for f in os.listdir(folder)
-                if f.startswith(seq_name) and f.lower().endswith(self.fits_extension)
-            ]
-        )
-        for idx, filename in enumerate(all_files):
-            file_path = os.path.join(folder, filename)
-            try:
-                with fits.open(file_path) as hdul:
-                    _ = hdul[0].data  # Try to access data
-
-            except Exception as e:
-                self.siril.log(f"Bad FITS file: {filename} — {e}", LogColor.SALMON)
-                bad_fits.append(idx + 1)  # Siril indices start at 1
-
-        if bad_fits:
-            self.siril.log(f"Unselecting bad frames: {bad_fits}", LogColor.SALMON)
-            for index in bad_fits:
-                try:
-                    self.siril.cmd("unselect", seq_name, index, index)
-                except Exception as e:
-                    self.siril.log(
-                        f"Failed to unselect index {index}: {e}", LogColor.RED
-                    )
-        else:
-            self.siril.log("No bad FITS files found.", LogColor.GREEN)
-
     # Save and Load Presets code
     def save_presets(self):
         """Save current UI settings to a JSON file in the working directory."""
         presets = {
             "telescope": self.telescope_combo.currentText(),
             "filter": self.filter_combo.currentText(),
-            "catalog": self.catalog_combo.currentText(),
+            # "catalog": self.catalog_combo.currentText(),
             "darks": self.darks_checkbox.isChecked(),
             "flats": self.flats_checkbox.isChecked(),
             "biases": self.biases_checkbox.isChecked(),
@@ -1541,6 +1918,8 @@ class PreprocessingInterface(QMainWindow):
             "filters": self.filters_checkbox.isChecked(),
             "roundness": self.roundness_spinbox.value(),
             "fwhm": self.fwhm_spinbox.value(),
+            "star_count_filter": self.star_count_filter_spinbox.value(),
+            "bg_filter": self.bg_filter_spinbox.value(),
             "feather": self.feather_checkbox.isChecked(),
             "feather_amount": self.feather_amount_spinbox.value(),
             "spcc": self.spcc_checkbox.isChecked(),
@@ -1593,13 +1972,13 @@ class PreprocessingInterface(QMainWindow):
             self.filter_combo.setCurrentText(
                 presets.get("filter", "No Filter (Broadband)")
             )
-            self.catalog_combo.setCurrentText(presets.get("catalog", "localgaia"))
+            # self.catalog_combo.setCurrentText(presets.get("catalog", "localgaia"))
             self.darks_checkbox.setChecked(presets.get("darks", False))
             self.flats_checkbox.setChecked(presets.get("flats", False))
             self.biases_checkbox.setChecked(presets.get("biases", False))
             self.cleanup_files_checkbox.setChecked(presets.get("cleanup", False))
             self.batch_size_spinbox.setValue(
-                presets.get("batch_size", UI_DEFAULTS["max_files_per_batch"])
+                presets.get("batch_size", self.max_files_per_batch)
             )
             self.bg_extract_checkbox.setChecked(presets.get("bg_extract", False))
             self.drizzle_checkbox.setChecked(presets.get("drizzle", False))
@@ -1612,6 +1991,10 @@ class PreprocessingInterface(QMainWindow):
             self.filters_checkbox.setChecked(presets.get("filters", False))
             self.roundness_spinbox.setValue(presets.get("roundness", 3.0))
             self.fwhm_spinbox.setValue(presets.get("fwhm", 3.0))
+            self.star_count_filter_spinbox.setValue(
+                presets.get("star_count_filter", 100.0)
+            )
+            self.bg_filter_spinbox.setValue(presets.get("bg_filter", 100.0))
             self.feather_checkbox.setChecked(presets.get("feather", False))
             self.feather_amount_spinbox.setValue(
                 presets.get("feather_amount", UI_DEFAULTS["feather_amount"])
@@ -1636,8 +2019,10 @@ class PreprocessingInterface(QMainWindow):
         drizzle: bool = False,
         drizzle_amount: float = UI_DEFAULTS["drizzle_amount"],
         pixel_fraction: float = UI_DEFAULTS["pixel_fraction"],
-        filter_roundness: float = 3.0,
-        filter_fwhm: float = 3.0,
+        filter_roundness: float = 100.0,
+        filter_fwhm: float = 100.0,
+        filter_bg: float = 100.0,
+        filter_star_count: float = 100.0,
         feather: bool = False,
         feather_amount: float = UI_DEFAULTS["feather_amount"],
         clean_up_files: bool = False,
@@ -1657,6 +2042,8 @@ class PreprocessingInterface(QMainWindow):
             f"drizzle_amount={drizzle_amount}\n"
             f"filter_roundness={filter_roundness}\n"
             f"filter_fwhm={filter_fwhm}\n"
+            f"filter_bg={filter_bg}\n"
+            f"filter_star_count={filter_star_count}\n"
             f"pixel_fraction={pixel_fraction}\n"
             f"feather={feather}\n"
             f"feather_amount={feather_amount}\n"
@@ -1665,6 +2052,14 @@ class PreprocessingInterface(QMainWindow):
             LogColor.BLUE,
         )
         self.siril.cmd("close")
+
+        if self.fits_files_count == 0:
+            QMessageBox.warning(
+                self,
+                "No FITS Files Found",
+                "No FITS files found in the lights directory. Please add files and try again.",
+            )
+            return
 
         # Check if old processing directories exist
         if (
@@ -1680,17 +2075,33 @@ class PreprocessingInterface(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                if os.path.exists("sessions"):
-                    shutil.rmtree("sessions")
-                    self.siril.log("Cleaned up old sessions directories", LogColor.BLUE)
-                if os.path.exists("process"):
-                    shutil.rmtree("process")
-                    self.siril.log("Cleaned up old process directory", LogColor.BLUE)
-                if os.path.exists("final_stack"):
-                    shutil.rmtree("final_stack")
+                try:
+                    if os.path.exists("sessions"):
+                        shutil.rmtree("sessions")
+                        self.siril.log(
+                            "Cleaned up old sessions directories", LogColor.BLUE
+                        )
+                    if os.path.exists("process"):
+                        shutil.rmtree("process")
+                        self.siril.log(
+                            "Cleaned up old process directory", LogColor.BLUE
+                        )
+                    if os.path.exists("final_stack"):
+                        shutil.rmtree("final_stack")
+                        self.siril.log(
+                            "Cleaned up old final_stack directory", LogColor.BLUE
+                        )
+                except Exception as e:
                     self.siril.log(
-                        "Cleaned up old final_stack directory", LogColor.BLUE
+                        "Error cleaning up old processing files in one or more of these directories: sessions, process, final_stack.",
+                        LogColor.RED,
                     )
+                    QMessageBox.warning(
+                        self,
+                        "Error",
+                        "Error cleaning up old processing files in one or more of these directories: sessions, process, final_stack.\nPlease remove them manually and try again.\n\n",
+                    )
+                    return
             else:
                 self.siril.log(
                     "User chose to preserve old processing files. Stopping script.",
@@ -1736,7 +2147,7 @@ class PreprocessingInterface(QMainWindow):
         is_windows = sys.platform.startswith("win")
 
         # only one batch will be run if less than max_files_per_batch OR not windows.
-        if num_files <= max_files_per_batch: # or not is_windows:
+        if num_files <= max_files_per_batch:  # or not is_windows:
             self.siril.log(
                 f"{num_files} files found in the lights directory which is less than or equal to {max_files_per_batch} files allowed per batch - no batching needed.",
                 LogColor.BLUE,
@@ -1846,8 +2257,10 @@ class PreprocessingInterface(QMainWindow):
                 seq_name=final_stack_seq_name,
                 drizzle_amount=drizzle_amount,
                 pixel_fraction=pixel_fraction,
-                filter_roundness=3.0,
-                filter_fwhm=3.0,
+                filter_roundness=100.0,
+                filter_fwhm=100.0,
+                filter_bg=100.0,
+                filter_star_count=100.0,
             )
             self.clean_up(prefix=final_stack_seq_name)
             registered_final_stack_seq_name = f"r_{final_stack_seq_name}"
@@ -1857,14 +2270,16 @@ class PreprocessingInterface(QMainWindow):
                 seq_name=registered_final_stack_seq_name,
                 feather=True,
                 rejection=False,
-                feather_amount=60,
+                feather_amount=100,
                 output_name="final_result",
+                overlap_norm=True,
             )
             self.load_image(image_name="final_result")
 
             # cleanup final_stack directory
             # shutil.rmtree(final_stack_seq_name, ignore_errors=True)
-            self.clean_up(prefix=registered_final_stack_seq_name)
+            if clean_up_files:
+                self.clean_up(prefix=registered_final_stack_seq_name)
 
             # Go back to working dir
             self.siril.cmd("cd", "../")
@@ -1890,27 +2305,10 @@ class PreprocessingInterface(QMainWindow):
             self.load_image(
                 image_name=os.path.basename(img)
             )  # Load either og or spcc image
-
+        
+        # Get some stacking deets
+        self.stacking_details()
         # self.clean_up()
-
-        # TODO: Remove in RC1
-        # if bg extraction AND drizzle are checked, we swap the channels to mitigate a siril bug that's only exists for Seestars
-        self.siril.log("Checking if color channel swap is needed...", LogColor.BLUE)
-        self.siril.log(
-            f"Telescope: {telescope}, Drizzle: {self.drizzle_status}, BG Extract: {self.bg_extract_checkbox.isChecked()}",
-            LogColor.BLUE,
-        )
-        if (
-            self.bg_extract_checkbox.isChecked()
-            and self.drizzle_status
-            and telescope in ["ZWO Seestar S50", "ZWO Seestar S30"]
-        ):
-            img_path = file_name + self.fits_extension
-            self.swap_red_blue_channels(image_path=img_path)
-            self.siril.log(
-                "If the colors look off, please load the RBswapped image.",
-                LogColor.SALMON,
-            )
 
         self.siril.log(
             f"Finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -1928,7 +2326,6 @@ class PreprocessingInterface(QMainWindow):
         """,
             LogColor.BLUE,
         )
-
         self.close_dialog()
 
 
